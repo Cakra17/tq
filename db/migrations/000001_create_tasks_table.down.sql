@@ -1,0 +1,1 @@
+IF TABLE EXISTS DROP TABLE tasks; 
