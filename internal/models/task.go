@@ -1,7 +1,6 @@
 package models
 
 import (
-	"database/sql/driver"
 	"encoding/json"
 	"time"
 )
@@ -15,13 +14,13 @@ const (
 	StatusRetrying = "RETRYING"
 )
 
-type TaskConfig map[string]interface{}
+type TaskConfig map[string]any
 
-func (tc TaskConfig) Value() (driver.Value, error) {
+func (tc TaskConfig) Value() ([]byte, error) {
 	return json.Marshal(tc)
 }
 
-func (tc *TaskConfig) Scan(value interface{}) error {
+func (tc *TaskConfig) Scan(value any) error {
 	if value == nil {
 		return nil
 	}

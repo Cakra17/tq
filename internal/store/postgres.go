@@ -143,6 +143,53 @@ func (r *Repo) UpdateTaskStatus(
 	return err
 }
 
+func (r *Repo) UpdateTaskCompletion(ctx context.Context, taskID, status string, completedAt *time.Time) error {
+	query := `
+		UPDATE tasks
+		SET status = $1, completed_at = $2
+		WHERE id = $3
+	`
+	_, err := r.db.ExecContext(ctx, query, status, completedAt, taskID)
+	return err
+}
+
+func (r *Repo) ScheduleTaskRetry(ctx context.Context, taskID string, retryCount int, retryAt *time.Time) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	query := `
+		UPDATE tasks
+		SET retry_count = $1, status = 'PENDING', assigned_worker_id = NULL
+		WHERE id = $2, 
+	`
+	_, err = r.db.ExecContext(ctx, query, retryCount, taskID)
+	if err != nil {
+		return err
+	}
+
+	score := float64(5*1000000) + float64(retryAt.Unix())
+	err = r.rd.ZAdd(ctx, "task_queue", redis.Z{
+		Score: score,
+		Member: taskID,
+	}).Err()
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (r *Repo) RequeTask(ctx context.Context, task *models.Task) error {
+  score := float64(task.Priority * 1000000) + float64(time.Now().Unix()) 
+
+  err := r.rd.ZAdd(ctx, "task_queue", redis.Z{
+    Score: score,
+    Member: task.ID,
+  }).Err()
+  return err
+}
 
 func ConnectDB(cdf config.DatabaseConfig) *sql.DB {
 	dsn := fmt.Sprintf(
