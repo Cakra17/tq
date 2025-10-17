@@ -34,25 +34,24 @@ func (r *Repo) AddTask(ctx context.Context,t models.Task) error {
 
 	query := `
 		INSERT INTO tasks (
-			id, type, status, priority, user_id, resource_id, config,
-			created_at, started_at, completed_at, retry_count, max_retries,
-			assigned_worker_id, worked_assigned_at
+			id, type, status, priority, config, created_at, 
+			started_at, completed_at, retry_count, max_retries,
+			assigned_worker_id, worker_assigned_at
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, 
-			$8, $9, $10, $11, $12, $13, $14
+			$8, $9, $10, $11, $12
 		)
 	`
 
 	_, err = r.db.ExecContext(ctx, query, 
-		t.ID, t.Type, t.Status, t.Priority, t.UserID, t.ResourceID, t.Config,
-		t.CreatedAt, t.StartedAt, t.CompletedAt, t.RetryCount, t.MaxRetries,
+		t.ID, t.Type, t.Status, t.Priority, t.Config,t.CreatedAt, 
+		t.StartedAt, t.CompletedAt, t.RetryCount, t.MaxRetries,
 		t.AssignedWorkerID, t.WorkedAssignedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("Failed to insert task: %v", err)
 	}
 
-	// using prior queue for redis
 	score := float64(t.Priority * 1000000) + float64(t.CreatedAt.Unix())
 	err = r.rd.ZAdd(ctx, "task_queue", redis.Z{
 		Score: score,
@@ -69,14 +68,14 @@ func (r *Repo) GetTask(ctx context.Context, id string) (*models.Task, error) {
 	var t models.Task
 	query := `
 	SELECT 
-		id, type, status, priority, user_id, resource_id, config,
+		id, type, status, priority, config,
 		created_at, started_at, completed_at, retry_count, max_retries,
 		assigned_worker_id, worker_assigned_at
 	FROM tasks WHERE id = $1`
 	
 	row := r.db.QueryRowContext(ctx, query, id)
 	err := row.Scan(
-		&t.ID, &t.Type, &t.Status, &t.Priority, &t.UserID, &t.ResourceID, &t.Config,
+		&t.ID, &t.Type, &t.Status, &t.Priority, &t.Config,
 		&t.CreatedAt, &t.StartedAt, &t.CompletedAt, &t.RetryCount, &t.MaxRetries,
 		&t.AssignedWorkerID, &t.WorkedAssignedAt,
 	)
@@ -93,10 +92,9 @@ func (r *Repo) GetTask(ctx context.Context, id string) (*models.Task, error) {
 }
 
 func (r *Repo) PullNextTask(ctx context.Context, workerID string) (*models.Task, error) {
-	// Pop highest priority task (ZPOPMAX)
 	result, err := r.rd.ZPopMax(ctx, "task_queue", 1).Result()
 	if err == redis.Nil {
-		return nil, nil // no tasks available
+		return nil, nil
 	}
 
 	if err != nil {
@@ -114,7 +112,7 @@ func (r *Repo) PullNextTask(ctx context.Context, workerID string) (*models.Task,
 	}
 
 	now := time.Now()
-	task.Status = models.StatusRunning
+	task.Status = models.STATUSRUNNING
 	task.StartedAt = &now
 	task.AssignedWorkerID = &workerID
 	task.WorkedAssignedAt = &now
@@ -153,19 +151,24 @@ func (r *Repo) UpdateTaskCompletion(ctx context.Context, taskID, status string, 
 	return err
 }
 
-func (r *Repo) ScheduleTaskRetry(ctx context.Context, taskID string, retryCount int, retryAt *time.Time) error {
+func (r *Repo) ScheduleTaskRetry(
+	ctx context.Context, taskID string, retryCount int, 
+	retryAt *time.Time, workerId string,
+) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
+	status := models.STATUSQUEUED
+
 	query := `
 		UPDATE tasks
-		SET retry_count = $1, status = 'PENDING', assigned_worker_id = NULL
-		WHERE id = $2, 
+		SET retry_count = $1, status = $2, assigned_worker_id = $3
+		WHERE id = $4, 
 	`
-	_, err = r.db.ExecContext(ctx, query, retryCount, taskID)
+	_, err = r.db.ExecContext(ctx, query, retryCount, status, workerId, taskID)
 	if err != nil {
 		return err
 	}
@@ -199,7 +202,7 @@ func ConnectDB(cdf config.DatabaseConfig) *sql.DB {
 
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
-		log.Fatalf("Erorr Opening Database: %v", err)
+		log.Fatalf("Error Opening Database: %v", err)
 	}
 
 	db.SetMaxOpenConns(cdf.MaxConnLifetime)
