@@ -1,10 +1,12 @@
+CREATE TYPE status
+AS
+ENUM('COMPLETED', 'RETRYING', 'FAILED', 'QUEUE');
+
 CREATE TABLE IF NOT EXISTS tasks (
   id UUID PRIMARY KEY,
   type VARCHAR(50) NOT NULL,
-  status VARCHAR(20) NOT NULL DEFAULT "PENDING",
+  status status NOT NULL DEFAULT 'PENDING',
   priority INTEGER NOT NULL DEFAULT 5,
-  user_id BIGINT,
-  resource_id VARCHAR(100),
   config JSONB,
   created_at TIMESTAMP DEFAULT NOW(),
   started_at TIMESTAMP,
