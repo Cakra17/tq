@@ -1,0 +1,36 @@
+version: "3.8"
+
+services:
+  redis:
+    image: redis:latest
+    ports:
+      - "6379:6379"
+    environment:
+      REDIS_HOST: localhost:6379
+      REDIS_PASSWORD: 
+      REDIS_DB: 0
+    networks:
+      - queue-net
+    volumes:
+      - redis_data:/data
+  
+  postgres:
+    image: postgres:15-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: tq
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: adminsecret
+    networks:
+      - queue-net
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    
+networks:
+  queue-net:
+    driver: bridge
+
+volumes:
+  redis_data:
+  postgres_data:
