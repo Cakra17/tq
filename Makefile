@@ -12,4 +12,4 @@ deps:
 	go mod tidy
 
 clean:
-	rm tq.exe
+	rm -r ./bin/
