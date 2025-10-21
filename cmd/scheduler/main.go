@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/cakra17/tq/internal/config"
 	"github.com/cakra17/tq/internal/handlers"
@@ -40,22 +42,32 @@ func main() {
     Handler: mux,
   }
 
+	ctx := context.Background()
+	closed := make(chan struct{})
+
   go func() {
-    log.Printf("Listening on port %s", cfg.AppPort)
-    if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-      log.Fatalf("Server failed: %v", err)
-    }
-  }()
+		sigint := make(chan os.Signal, 1)
+		signal.Notify(sigint, syscall.SIGINT, syscall.SIGTERM)
+		signal := <-sigint
+		
+		log.Printf("Received %s signal, shutting down server", signal.String())
+		shutdownCtx, cancel := context.WithTimeout(ctx, 5 * time.Second)
+		defer cancel()
 
-  // gracefully shutdown
-  sig := make(chan os.Signal, 1)
-  signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-  <-sig
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Fatalf("Server forced to shutdown: %v", err)
+		}
 
-  if err := server.Shutdown(context.Background()); err != nil {
-    log.Fatalf("Server forced to shutdown: %v", err)
-  }
-  log.Println("Server shutdown gracefully")
+		close(closed)
+	}()
+
+	log.Printf("server running on port %s", server.Addr[1:])
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("Failed to run server: %v", err)
+	}
+
+	<-closed
+	log.Println("Server shutdown gracefully")
 }
 
 

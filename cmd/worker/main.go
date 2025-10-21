@@ -39,6 +39,7 @@ func main() {
     cancel()
   }()
 
+  logger.Info("Worker is running")
   if err := w.Start(ctx); err != nil {
     log.Fatalf("Worker failed: %v", err)
   }

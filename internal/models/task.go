@@ -1,6 +1,7 @@
 package models
 
 import (
+	"database/sql/driver"
 	"encoding/json"
 	"time"
 )
@@ -14,7 +15,10 @@ const (
 
 type TaskConfig map[string]any
 
-func (tc TaskConfig) Value() ([]byte, error) {
+func (tc TaskConfig) Value() (driver.Value, error) {
+  if tc == nil {
+    return nil,  nil
+  }
 	return json.Marshal(tc)
 }
 

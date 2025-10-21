@@ -36,6 +36,7 @@ func (t *TaskHandler) Add(w http.ResponseWriter, r *http.Request) {
 	task.ID = uuid.Must(uuid.NewV7()).String()
 	task.Status = models.STATUSQUEUED
 	task.CreatedAt = &now
+
 	if task.Priority == 0 {
 		task.Priority = 5
 	}

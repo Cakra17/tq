@@ -44,7 +44,7 @@ func (r *Repo) AddTask(ctx context.Context,t models.Task) error {
 	`
 
 	_, err = r.db.ExecContext(ctx, query, 
-		t.ID, t.Type, t.Status, t.Priority, t.Config,t.CreatedAt, 
+		t.ID, t.Type, t.Status, t.Priority, *t.Config, t.CreatedAt, 
 		t.StartedAt, t.CompletedAt, t.RetryCount, t.MaxRetries,
 		t.AssignedWorkerID, t.WorkedAssignedAt,
 	)
