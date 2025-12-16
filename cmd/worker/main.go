@@ -17,14 +17,14 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
   cfg := config.LoadEnv()
-  db := store.ConnectDB(cfg.Database)
-	rd := store.NewRedisClient(cfg.Redis)
+  db := config.ConnectDB(cfg.Database)
+	queueService := store.NewQueueService(cfg.Redis, logger)
 
-  repo := store.NewRepo(db, rd)
+  repo := store.NewTaskRepo(db, logger)
 
   executor := worker.NewDefaultExecutor(logger)
 
-  w := worker.NewWorker(repo, logger, executor, 5)
+  w := worker.NewWorker(repo, &queueService, logger, executor, 1)
 
   ctx, cancel := context.WithCancel(context.Background())
   defer cancel()

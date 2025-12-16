@@ -4,33 +4,36 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
-	"github.com/cakra17/tq/internal/config"
 	"github.com/cakra17/tq/internal/models"
 	_ "github.com/lib/pq"
-	"github.com/redis/go-redis/v9"
 )
 
-type Repo struct {
+type TaskRepo struct {
 	db *sql.DB
-	rd *redis.Client
+	lg *slog.Logger
 }
 
-func NewRepo(db *sql.DB, rd *redis.Client) Repo {
-	return Repo{ 
-		db: db,
-		rd: rd,
-	}
+func NewTaskRepo(db *sql.DB, lg *slog.Logger) TaskRepo {
+	return TaskRepo{ db: db, lg: lg }
 }
 
-func (r *Repo) AddTask(ctx context.Context,t models.Task) error {
+func (r *TaskRepo) AddTask(ctx context.Context,t models.Task) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("Failed to begin transaction %v", err)
+		r.lg.Error("Database Error", "Failed to begin transaction %s", err.Error())
+		return err
 	}
-	defer tx.Rollback()
+	defer func () {
+		if err != nil {
+			if rbErr := tx.Rollback(); rbErr != nil {
+				r.lg.Error("Database Error", "Failed to rollback transaction", rbErr.Error())
+				return
+			}
+		}
+	}()
 
 	query := `
 		INSERT INTO tasks (
@@ -44,176 +47,196 @@ func (r *Repo) AddTask(ctx context.Context,t models.Task) error {
 	`
 
 	_, err = r.db.ExecContext(ctx, query, 
-		t.ID, t.Type, t.Status, t.Priority, *t.Config, t.CreatedAt, 
+		t.ID, t.Type, t.Status, t.Priority, t.Config, t.CreatedAt, 
 		t.StartedAt, t.CompletedAt, t.RetryCount, t.MaxRetries,
 		t.AssignedWorkerID, t.WorkedAssignedAt,
 	)
 	if err != nil {
-		return fmt.Errorf("Failed to insert task: %v", err)
+		r.lg.Error("Database Error", "Failed to insert task", err.Error())
+		return err
 	}
 
-	score := float64(t.Priority * 1000000) + float64(t.CreatedAt.Unix())
-	err = r.rd.ZAdd(ctx, "task_queue", redis.Z{
-		Score: score,
-		Member: t.ID,
-	}).Err()
-	if err != nil {
-		return fmt.Errorf("Failed to add task to queue: %v", err)
+	if err := tx.Commit(); err != nil {
+		r.lg.Error("Database Error", "Failed to commit task", err.Error())
+		return err
 	}
 
-	return tx.Commit()
+	return nil
 }
 
-func (r *Repo) GetTask(ctx context.Context, id string) (*models.Task, error) {
+func (r *TaskRepo) GetTask(ctx context.Context, id string) (*models.Task, error) {
+	if id == "" {
+		return nil, fmt.Errorf("id is empty")
+	}
+
 	var t models.Task
 	query := `
 	SELECT 
 		id, type, status, priority, config,
-		created_at, started_at, completed_at, retry_count, max_retries,
+		created_at, started_at, completed_at, 
+		retry_count, max_retries,
 		assigned_worker_id, worker_assigned_at
 	FROM tasks WHERE id = $1`
 	
 	row := r.db.QueryRowContext(ctx, query, id)
 	err := row.Scan(
 		&t.ID, &t.Type, &t.Status, &t.Priority, &t.Config,
-		&t.CreatedAt, &t.StartedAt, &t.CompletedAt, &t.RetryCount, &t.MaxRetries,
+		&t.CreatedAt, &t.StartedAt, &t.CompletedAt, 
+		&t.RetryCount, &t.MaxRetries,
 		&t.AssignedWorkerID, &t.WorkedAssignedAt,
 	)
 
 	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("Task not found\n")
+		r.lg.ErrorContext(ctx, "Database Error", "Failed to get task", err.Error())
+		return nil, fmt.Errorf("Task not found")
 	}
 
 	if err != nil {
+		r.lg.ErrorContext(ctx, "Database Error", "Failed to get task", err.Error())
 		return nil, fmt.Errorf("Failed to get task: %v", err)
 	}
 
 	return &t, nil
 }
 
-func (r *Repo) PullNextTask(ctx context.Context, workerID string) (*models.Task, error) {
-	result, err := r.rd.ZPopMax(ctx, "task_queue", 1).Result()
-	if err == redis.Nil {
-		return nil, nil
-	}
-
-	if err != nil {
-		return nil, fmt.Errorf("Failed to pop task from queue: %v", err)
-	}
-
-	if len(result) == 0 {
-		return nil, nil
-	}
-
-	taskID := result[0].Member.(string)
-	task, err := r.GetTask(ctx, taskID)
-	if err != nil {
-		return nil, fmt.Errorf("task %s not found in database: %v", taskID, err)
-	}
-
-	now := time.Now()
-	task.Status = models.STATUSRUNNING
-	task.StartedAt = &now
-	task.AssignedWorkerID = &workerID
-	task.WorkedAssignedAt = &now
-
-	err = r.UpdateTaskStatus(ctx, taskID, task.Status, *task.AssignedWorkerID, task.StartedAt, task.WorkedAssignedAt)
-	if err != nil {
-		r.rd.ZAdd(ctx, "task_queue", redis.Z{
-			Score: result[0].Score,
-			Member: taskID,
-		})
-		return nil, fmt.Errorf("Failed to update task status: %v", err)
-	}
-	return task, nil
-}
-
-func (r *Repo) UpdateTaskStatus(
-	ctx context.Context, taskID, status, workerID string, 
-	startedAt, workedAssignAt *time.Time,
+func (r *TaskRepo) UpdateTaskStart(
+	ctx context.Context, taskID, workerID, status string,
+	retryCount int, startedAt, workedAssignAt *time.Time,
 ) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		r.lg.Error("Database Error", "Failed to begin transaction %s", err.Error())
+		return err
+	}
+	defer func() {
+		if err != nil {
+			if rbErr := tx.Rollback(); err != nil {
+				r.lg.Error("Database Error", "Failed to rollback transaction", rbErr.Error())
+				return
+			}
+		}
+	}()
+
 	query := `
 		UPDATE tasks
-		SET status = $1, assigned_worker_id = $2, worker_assigned_at = $3
-		WHERE id = $4
+		SET status = $1, assigned_worker_id = $2, worker_assigned_at = $3, started_at = $4, retry_count = $5
+		WHERE id = $6
 	`
-	_, err := r.db.ExecContext(ctx, query, status, workerID, workedAssignAt, taskID)
-	return err
+	_, err = r.db.ExecContext(ctx, query, status, workerID, workedAssignAt, startedAt, retryCount, taskID)
+	if err != nil {
+		r.lg.Error("Database Error", "Failed to update task", err.Error())
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		r.lg.Error("Database Error", "Failed to commit task", err.Error())
+		return err
+	}
+	return nil
 }
 
-func (r *Repo) UpdateTaskCompletion(ctx context.Context, taskID, status string, completedAt *time.Time) error {
+func (r *TaskRepo) UpdateTaskCompletion(
+	ctx context.Context, taskID, status string, 
+	completedAt *time.Time,
+) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		r.lg.Error("Database Error", "Failed to begin transaction %s", err.Error())
+		return err
+	}
+
+	defer func() {
+		if err != nil {
+			if rbErr := tx.Rollback(); rbErr != nil {
+				r.lg.Error("Database Error", "Failed to rollback transaction", rbErr.Error())
+				return 
+			}
+		}
+	}()
+
 	query := `
 		UPDATE tasks
 		SET status = $1, completed_at = $2
 		WHERE id = $3
 	`
-	_, err := r.db.ExecContext(ctx, query, status, completedAt, taskID)
-	return err
+	_, err = r.db.ExecContext(ctx, query, status, completedAt, taskID)
+	if err != nil {
+		r.lg.Error("Database Error", "Failed to update task completion", err.Error())
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		r.lg.Error("Database Error", "Failed to commit task", err.Error())
+		return err
+	}
+
+	return nil
 }
 
-func (r *Repo) ScheduleTaskRetry(
-	ctx context.Context, taskID string, retryCount int, 
-	retryAt *time.Time, workerId string,
-) error {
+func (r *TaskRepo) UpdateTaskRetry(ctx context.Context, taskID string, retryCount int) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		r.lg.Error("Database Error", "Failed to begin transaction %s", err.Error())
+		return err
+	}
+	defer func() {
+		if err != nil {
+			if rbErr := tx.Rollback(); rbErr != nil {
+				r.lg.Error("Database Error", "Failed to rollback transaction", rbErr.Error())
+				return
+			}
+		}
+	}()
+
+	status := models.STATUSRETRIED
+
+	query := `
+		UPDATE tasks
+		SET retry_count = $1, status = $2
+		WHERE id = $3, 
+	`
+	_, err = r.db.ExecContext(ctx, query, retryCount, status, taskID)
+	if err != nil {
+		r.lg.Error("Database Error", "Failed to update task retry", err.Error())
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		r.lg.Error("Database Error", "Failed to commit task", err.Error())
+		return err
+	}
+
+	return nil
+}
+
+func (r *TaskRepo) DeleteTask(ctx context.Context, taskID string) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
 
-	status := models.STATUSQUEUED
+	defer func () {
+		if err != nil {
+			if rbErr := tx.Rollback(); rbErr != nil {
+				r.lg.Error("Database Error", "Failed to rollback transaction", err.Error())
+				return
+			}
+		}
+	}()
 
 	query := `
-		UPDATE tasks
-		SET retry_count = $1, status = $2, assigned_worker_id = $3
-		WHERE id = $4, 
+		DELETE FROM tasks WHERE id = $1
 	`
-	_, err = r.db.ExecContext(ctx, query, retryCount, status, workerId, taskID)
+	_, err = r.db.ExecContext(ctx, query, taskID)
 	if err != nil {
+		r.lg.Error("Database Error", "Failed to delete task", err.Error())
 		return err
 	}
 
-	score := float64(5*1000000) + float64(retryAt.Unix())
-	err = r.rd.ZAdd(ctx, "task_queue", redis.Z{
-		Score: score,
-		Member: taskID,
-	}).Err()
-	if err != nil {
+	if err := tx.Commit(); err != nil {
+		r.lg.Error("Database Error", "Failed to commit task", err.Error())
 		return err
 	}
-	return tx.Commit()
+
+	return nil
 }
-
-func (r *Repo) RequeTask(ctx context.Context, task *models.Task) error {
-  score := float64(task.Priority * 1000000) + float64(time.Now().Unix()) 
-
-  err := r.rd.ZAdd(ctx, "task_queue", redis.Z{
-    Score: score,
-    Member: task.ID,
-  }).Err()
-  return err
-}
-
-func ConnectDB(cdf config.DatabaseConfig) *sql.DB {
-	dsn := fmt.Sprintf(
-		"postgres://%s:%s@%s:%s/%s?sslmode=disable",
-		cdf.Username, cdf.Password, cdf.Host, cdf.Port, cdf.Name,
-	)
-
-	db, err := sql.Open("postgres", dsn)
-	if err != nil {
-		log.Fatalf("Error Opening Database: %v", err)
-	}
-
-	db.SetMaxOpenConns(cdf.MaxConnLifetime)
-	db.SetMaxIdleConns(cdf.MaxConnIdleTime)
-	db.SetConnMaxIdleTime(time.Duration(cdf.MaxIdleConnection) * time.Second)
-	db.SetConnMaxLifetime(time.Duration(cdf.MaxConnLifetime) * time.Second)
-
-	if err := db.Ping(); err != nil {
-		log.Fatalf("Erorr Opening Database: %v", err)
-	}
-	log.Println("Connected to Postgres successfully")
-	return db
-}
-

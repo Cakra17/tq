@@ -13,33 +13,36 @@ import (
 
 	"github.com/cakra17/tq/internal/config"
 	"github.com/cakra17/tq/internal/handlers"
+	"github.com/cakra17/tq/internal/models"
 	"github.com/cakra17/tq/internal/store"
 )
 
 func main() {
 	mux := http.NewServeMux()
 
-	// configuration
 	cfg := config.LoadEnv()
-	db := store.ConnectDB(cfg.Database)
-	rd := store.NewRedisClient(cfg.Redis)
+	db := config.ConnectDB(cfg.Database)
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	
+	queueService := store.NewQueueService(cfg.Redis, logger)
+	taskRepo := store.NewTaskRepo(db, logger)
 
-	// repository
-	repo := store.NewRepo(db, rd)
+	taskHandler := handlers.NewTaskHandler(taskRepo, logger, queueService)
 
-	// handler
-	taskHandler := handlers.NewTaskHandler(repo, logger)
-
-	// endpoint
-	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Hawo"))
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		models.SendResponse(w, http.StatusOK, models.Response{
+			Message: "App is fine",
+		})
 	})
-	mux.HandleFunc("POST /", cors(taskHandler.Add))
+	mux.HandleFunc("POST /tasks", cors(taskHandler.Add))
+	mux.HandleFunc("GET /tasks/{id}", cors(taskHandler.GetTaskById))
 
   server := &http.Server{
     Addr: cfg.AppPort,
     Handler: mux,
+		WriteTimeout: time.Minute,
+		ReadTimeout: time.Minute,
+		IdleTimeout: time.Minute,
   }
 
 	ctx := context.Background()
@@ -69,7 +72,6 @@ func main() {
 	<-closed
 	log.Println("Server shutdown gracefully")
 }
-
 
 func cors(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
