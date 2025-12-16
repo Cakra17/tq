@@ -3,6 +3,7 @@ package models
 import (
 	"database/sql/driver"
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -11,31 +12,46 @@ const (
 	STATUSRUNNING = "RUNNING"
 	STATUSCOMPLETED = "COMPLETED"
 	STATUSFAILED = "FAILED"
+	STATUSRETRIED = "RETRIED"
 )
 
 type TaskConfig map[string]any
 
 func (tc TaskConfig) Value() (driver.Value, error) {
   if tc == nil {
-    return nil,  nil
+    return nil, nil
   }
 	return json.Marshal(tc)
 }
 
 func (tc *TaskConfig) Scan(value any) error {
 	if value == nil {
+		*tc = nil
 		return nil
 	}
 
-	return json.Unmarshal(value.([]byte), tc)
+	var bytesVal []byte
+
+	switch t := value.(type) {
+	case []byte:
+		bytesVal = t
+	case string:
+		bytesVal = []byte(t)
+	default:
+		return fmt.Errorf("cannot scan %T into TaskConfig", value)
+	}
+
+	return json.Unmarshal(bytesVal, tc)
 }
+
+
 
 type Task struct {
 	ID               string         `json:"id" db:"id"`
 	Type             string         `json:"type" db:"type"`
 	Status           string         `json:"status" db:"status"`
 	Priority         int	          `json:"priority" db:"priority"`
-	Config					 *TaskConfig 		`json:"config" db:"config"`
+	Config					 TaskConfig 		`json:"config" db:"config"`
 	CreatedAt        *time.Time     `json:"created_at" db:"created_at"`
 	StartedAt        *time.Time     `json:"started_at" db:"started_at"`
 	CompletedAt      *time.Time     `json:"completed_at" db:"completed_at"`

@@ -1,7 +1,10 @@
 package config
 
 import (
+	"database/sql"
+	"fmt"
 	"log"
+	"time"
 
 	"github.com/joeshaw/envdecode"
 	"github.com/joho/godotenv"
@@ -42,4 +45,27 @@ func LoadEnv() Config {
 	}
 	log.Println("Env setup finished")
 	return cfg
+}
+
+func ConnectDB(cdf DatabaseConfig) *sql.DB {
+	dsn := fmt.Sprintf(
+		"postgres://%s:%s@%s:%s/%s?sslmode=disable",
+		cdf.Username, cdf.Password, cdf.Host, cdf.Port, cdf.Name,
+	)
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		log.Fatalf("Error Opening Database: %v", err)
+	}
+
+	db.SetMaxOpenConns(cdf.MaxConnLifetime)
+	db.SetMaxIdleConns(cdf.MaxConnIdleTime)
+	db.SetConnMaxIdleTime(time.Duration(cdf.MaxIdleConnection) * time.Second)
+	db.SetConnMaxLifetime(time.Duration(cdf.MaxConnLifetime) * time.Second)
+
+	if err := db.Ping(); err != nil {
+		log.Fatalf("Erorr Opening Database: %v", err)
+	}
+	log.Println("Connected to Postgres successfully")
+	return db
 }
