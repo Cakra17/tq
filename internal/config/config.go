@@ -28,9 +28,18 @@ type RedisConfig struct {
 	DB int `env:"REDIS_ENV"`
 }
 
+type SMTPConfig struct {
+	Host string `env:"SMTP_HOST"`
+	Port string	`env:"SMTP_PORT"`
+	SenderName string `env:"SMTP_SENDER_NAME"`
+	AuthEmail string `env:"SMTP_AUTH_EMAIL"`
+	AuthPassword string `env:"SMTP_AUTH_PASSWORD"`
+}
+
 type Config struct {
 	Database DatabaseConfig
 	Redis RedisConfig
+	SMTP SMTPConfig
 	AppPort  string `env:"APP_PORT,default=6969"`
 }
 
