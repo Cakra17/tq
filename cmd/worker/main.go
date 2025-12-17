@@ -22,7 +22,7 @@ func main() {
 
   repo := store.NewTaskRepo(db, logger)
 
-  executor := worker.NewDefaultExecutor(logger)
+  executor := worker.NewDefaultExecutor(logger, cfg.SMTP)
 
   w := worker.NewWorker(repo, &queueService, logger, executor, 1)
 

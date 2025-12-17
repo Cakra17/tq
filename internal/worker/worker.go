@@ -14,37 +14,39 @@ import (
 
 type Worker struct {
 	ID   string
-	repo store.Repo
+	repo store.TaskRepo
+	queue *store.QueueService
 	logger *slog.Logger
 	executor *DefaultExecutor
-	concurency int
+	count int
 	stopCh chan struct{}
 	wg sync.WaitGroup
 }
 
-type TaskExecutor interface {
-	Execute(ctx context.Context, task models.Task) error
-}
-
-func NewWorker(repo store.Repo, logger *slog.Logger, executor *DefaultExecutor, concurency int) *Worker {
-	if concurency <= 0 {
-		concurency = 5
+func NewWorker(
+	repo store.TaskRepo, queue *store.QueueService, 
+	logger *slog.Logger, executor *DefaultExecutor, 
+	count int,
+) *Worker {
+	if count <= 0 {
+		count = 5
 	}
 
 	return &Worker{
 		ID: fmt.Sprintf("worker_%s", uuid.NewString()[:8]),
 		repo: repo,
+		queue: queue,
 		logger: logger,
 		executor: executor,
-		concurency: concurency,
+		count: count,
 		stopCh: make(chan struct{}),
 	}
 }
 
 func (w *Worker) Start(ctx context.Context) error {
-	taskCh := make(chan *models.Task, w.concurency*2)
+	taskCh := make(chan *models.Task, w.count*2)
 	
-	for i := range w.concurency {
+	for i := 1; i <= w.count; i++ {
 		w.wg.Add(1)
 		go w.taskWorker(ctx, taskCh, i)
 	}
@@ -55,10 +57,8 @@ func (w *Worker) Start(ctx context.Context) error {
 	<-w.stopCh
 	w.logger.Info("Worker shutting down", "worked_id", w.ID)
 
-	close(w.stopCh)
-
 	w.wg.Wait()
-
+	
 	w.logger.Info("Worker shutdown gracefully", "worker_id", w.ID)
 	return nil
 }
@@ -81,9 +81,15 @@ func (w *Worker) taskFetcher(ctx context.Context, taskCh chan <- *models.Task) {
 			return
 		case <-ticker.C:
 			for {
-				task, err := w.repo.PullNextTask(ctx, w.ID)
+				taskID, err := w.queue.PullTask(ctx)
 				if err != nil {
-					w.logger.Error("Error pulling task", "error", err)
+					w.logger.Error("Worker Error", "Failed to pull task from queue", err.Error())
+					break
+				}
+
+				task, err := w.repo.GetTask(ctx, taskID)
+				if err != nil {
+					w.logger.Error("Worker Error", "Failed to get task from db", err.Error())
 					break
 				}
 
@@ -93,16 +99,14 @@ func (w *Worker) taskFetcher(ctx context.Context, taskCh chan <- *models.Task) {
 
 				select {
 				case taskCh <- task:
-
-				// todo
 				case <-ctx.Done():
-          w.repo.RequeTask(ctx, task)
+          w.queue.PushTask(ctx, task)
           return
 				case <-w.stopCh:
-          w.repo.RequeTask(ctx, task) 
+          w.queue.PushTask(ctx, task) 
           return
 				default:
-					break
+					return
 				}
 			}
 		}
@@ -112,7 +116,7 @@ func (w *Worker) taskFetcher(ctx context.Context, taskCh chan <- *models.Task) {
 func (w *Worker) taskWorker(ctx context.Context, taskCh <- chan *models.Task, workerNum int) {
 	defer w.wg.Done()
 
-	workerLogger := w.logger.With("worker_id", w.ID, "goroutine", workerNum)
+	workerLogger := w.logger.With("worker_id", w.ID, "worker_num", workerNum)
 	workerLogger.Info("Task worker started")
 
 	for {
@@ -124,21 +128,33 @@ func (w *Worker) taskWorker(ctx context.Context, taskCh <- chan *models.Task, wo
 				workerLogger.Info("Task worker is shutting down")
 				return
 			}
-
-			w.processTask(ctx, task, workerLogger)
+			w.processTask(ctx, task)
 		}
 	}
 }
 
-func (w *Worker) processTask(ctx context.Context, task *models.Task, logger *slog.Logger) {
-	logger.Info("Processing task",
+func (w *Worker) processTask(ctx context.Context, task *models.Task) {
+	startTime := time.Now()
+	workerStartTime := startTime
+
+	if err := w.repo.UpdateTaskStart(
+		ctx, task.ID, w.ID, models.STATUSRUNNING, 
+		task.RetryCount, &startTime, &workerStartTime,
+	); err != nil {
+		w.logger.Info(
+			"Failed to start task",
+			"task_id", task.ID,
+			"task_type", task.Type,
+		)
+		return
+	}
+
+	w.logger.Info("Processing task",
 		"task_id", task.ID,
 		"task_type", task.Type,
 	)
 
-	startTime := time.Now()
-
-	execErr := w.executor.Execute(ctx, *task)
+	execErr := w.executor.Execute(ctx, task)
 	duration := time.Since(startTime)
 
 	if execErr != nil {
@@ -150,71 +166,73 @@ func (w *Worker) processTask(ctx context.Context, task *models.Task, logger *slo
 
 func (w *Worker) handleTaskSuccess(ctx context.Context, task *models.Task, duration time.Duration) error {
 	now := time.Now()
-	task.Status = "COMPLETED"
 	task.CompletedAt = &now
 	
-	err := w.repo.UpdateTaskCompletion(ctx, task.ID, "COMPLETED", &now)
+	err := w.repo.UpdateTaskCompletion(ctx, task.ID, models.STATUSCOMPLETED, &now)
 	if err != nil {
-			w.logger.Error("Failed to update completed task", 
-					"task_id", task.ID, "error", err)
-			return err
+		w.logger.Error(
+			"Failed to update completed task", 
+			"task_id", task.ID, 
+			"error", err,
+		)
+		return err
 	}
 	
 	w.logger.Info("Task completed successfully", 
-			"task_id", task.ID, 
-			"duration", duration,
-			"worker_id", w.ID)
+		"task_id", task.ID, 
+		"duration", duration,
+		"worker_id", w.ID,
+	)
 	
 	return nil
 }
 
 func (w *Worker) handleTaskFailure(ctx context.Context, task *models.Task, execErr error) error {
 	w.logger.Error("Task execution failed", 
-			"task_id", task.ID, 
-			"error", execErr,
-			"retry_count", task.RetryCount,
-			"max_retries", task.MaxRetries)
+		"task_id", task.ID, 
+		"error", execErr,
+		"retry_count", task.RetryCount,
+		"max_retries", task.MaxRetries,
+	)
 	
-	// Check if we should retry
-	if task.RetryCount < task.MaxRetries {
-			return w.retryTask(ctx, task)
+	if task.CanRetry() {
+		return w.retryTask(ctx, task)
 	}
-	
-	// Max retries exceeded - mark as permanently failed
+
 	now := time.Now()
-	task.Status = "FAILED"
+	task.Status = models.STATUSFAILED
 	task.CompletedAt = &now
 	
-	err := w.repo.UpdateTaskCompletion(ctx, task.ID, "FAILED", &now)
+	err := w.repo.UpdateTaskCompletion(ctx, task.ID, models.STATUSFAILED, &now)
 	if err != nil {
-			w.logger.Error("Failed to update failed task", 
-					"task_id", task.ID, "error", err)
-			return err
+		w.logger.Error("Failed to update failed task", 
+			"task_id", task.ID, "error", err)
+		return err
 	}
 	
 	w.logger.Error("Task permanently failed", 
-			"task_id", task.ID,
-			"final_error", execErr.Error())
+		"task_id", task.ID,
+		"final_error", execErr.Error())
 	
 	return nil
 }
 
 func (w *Worker) retryTask(ctx context.Context, task *models.Task) error {
-  newRetryCount := task.RetryCount + 1
+	task.RetryCount += 1
 
-  backOffDelay := min(time.Duration(1<<uint(newRetryCount-1)) * time.Second, 5 * time.Minute)
+	err := w.repo.UpdateTaskRetry(ctx, task.ID, task.RetryCount)
+	if err != nil {
+		return err
+	}
 
-  retryAt := time.Now().Add(backOffDelay)
-
-  err := w.repo.ScheduleTaskRetry(ctx, task.ID, newRetryCount, &retryAt)
-  if err != nil {
-    return fmt.Errorf("Failed to retry task: %v", err)
-  }
+	err = w.queue.PushTask(ctx, task)
+	if err != nil {
+		return err
+	}
 
   w.logger.Info("Task scheduled for retry",
     "task_id", task.ID,
-    "retry_count", newRetryCount,
-    "retry_at", retryAt,
+    "retry_count", task.RetryCount,
   )
   return nil
 }
