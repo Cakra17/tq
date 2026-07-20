@@ -7,8 +7,10 @@ import (
 )
 
 type Response struct {
-	Message string `json:"message,omitempty"`
-	Data    any    `json:"data,omitempty"`
+	StatusCode int               `json:"code,omitempty"`
+	Header     map[string]string `json:"header,omitempty"`
+	Message    string            `json:"message,omitempty"`
+	Data       any               `json:"data,omitempty"`
 }
 
 func SendResponse(w http.ResponseWriter, status int, res Response) {
@@ -18,7 +20,8 @@ func SendResponse(w http.ResponseWriter, status int, res Response) {
 		return
 	}
 
-	w.Header().Set("Content-Type","application/json")
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	w.Write(jsonByte)
 }
+
